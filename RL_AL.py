@@ -740,7 +740,7 @@ def q_learning_validator(env, estimator, num_episodes, record_dir=None, plot=1):
 def enhanced_validator(env, estimator, num_episodes, k_list=[1,3,5], plot_pr=True):
     """
     增强版验证器
-    - baseline precision / recall / f1
+    - baseline precision / recall / f1 (与原validator一致)
     - 阈值搜索 + PR曲线 + PR-AUC
     - 检测延迟
     - 后处理 (consecutive k)
@@ -778,12 +778,17 @@ def enhanced_validator(env, estimator, num_episodes, k_list=[1,3,5], plot_pr=Tru
     preds = np.array(all_preds)
 
     # ---------------- baseline ----------------
-    baseline_p = precision_score(y_true, preds)
-    baseline_r = recall_score(y_true, preds)
-    baseline_f1 = f1_score(y_true, preds)
+    # 使用与原validator一致的计算方式
+    tp = np.sum((y_true == 1) & (preds == 1))
+    fp = np.sum((y_true == 0) & (preds == 1))
+    fn = np.sum((y_true == 1) & (preds == 0))
+    baseline_p = (tp + 1) / float(tp + fp + 1)
+    baseline_r = (tp + 1) / float(tp + fn + 1)
+    baseline_f1 = 2 * (baseline_p * baseline_r) / (baseline_p + baseline_r)
     print(f"Baseline -> Precision={baseline_p:.3f}, Recall={baseline_r:.3f}, F1={baseline_f1:.3f}")
 
     # ---------------- 阈值搜索 ----------------
+    from sklearn.metrics import precision_recall_curve, average_precision_score
     precisions, recalls, thresholds = precision_recall_curve(y_true, scores)
     f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
     best_idx = np.argmax(f1_scores)
@@ -793,12 +798,13 @@ def enhanced_validator(env, estimator, num_episodes, k_list=[1,3,5], plot_pr=Tru
     print(f"PR-AUC={average_precision_score(y_true, scores):.3f}")
 
     if plot_pr:
+        import matplotlib.pyplot as plt
+        import os
         plt.plot(recalls, precisions, label="PR curve")
         plt.scatter(recalls[best_idx], precisions[best_idx], color="red", label=f"Best F1={best_f1:.3f}")
         plt.xlabel("Recall")
         plt.ylabel("Precision")
         plt.legend()
-        # plt.show()
         save_path = os.path.join("pr_curve.png")
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close()
@@ -813,9 +819,9 @@ def enhanced_validator(env, estimator, num_episodes, k_list=[1,3,5], plot_pr=Tru
     # ---------------- 后处理 ----------------
     for k in k_list:
         y_post = consecutive_filter(y_pred_best, k=k)
-        p = precision_score(y_true, y_post)
-        r = recall_score(y_true, y_post)
-        f1v = f1_score(y_true, y_post)
+        p = np.sum((y_true == 1) & (y_post == 1)) / float(np.sum(y_post==1) + 1e-8)
+        r = np.sum((y_true == 1) & (y_post == 1)) / float(np.sum(y_true==1) + 1e-8)
+        f1v = 2 * (p * r) / (p + r + 1e-8)
         print(f"After consecutive k={k} -> Precision={p:.3f}, Recall={r:.3f}, F1={f1v:.3f}")
 
     return {
@@ -824,6 +830,8 @@ def enhanced_validator(env, estimator, num_episodes, k_list=[1,3,5], plot_pr=Tru
         "pr_auc": average_precision_score(y_true, scores),
         "delay_mean": mean_delay
     }
+
+
 
 # 辅助函数
 def detection_delay(y_true, y_pred):
