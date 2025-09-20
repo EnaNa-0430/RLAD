@@ -10,8 +10,17 @@ import os
 import time
 from scipy import stats
 
+from sklearn.metrics import precision_score, recall_score, f1_score, precision_recall_curve, average_precision_score
+
+
 import tensorflow as tf
 tf.compat.v1.disable_eager_execution()
+
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+tf.random.set_random_seed(seed)
+os.environ["PYTHONHASHSEED"] = str(seed)
 
 #from tensorflow.contrib import rnn
 
@@ -727,6 +736,121 @@ def q_learning_validator(env, estimator, num_episodes, record_dir=None, plot=1):
     return f1_overall / num_episodes
 
 
+# new
+def enhanced_validator(env, estimator, num_episodes, k_list=[1,3,5], plot_pr=True):
+    """
+    增强版验证器
+    - baseline precision / recall / f1
+    - 阈值搜索 + PR曲线 + PR-AUC
+    - 检测延迟
+    - 后处理 (consecutive k)
+    """
+
+    all_y_true, all_scores, all_preds = [], [], []
+
+    for i_episode in range(num_episodes):
+        state = env.reset()
+        while env.datasetidx < env.datasetrng * 0.9:  # 验证集
+            state = env.reset()
+
+        y_true, scores, preds = [], [], []
+        done = False
+
+        while not done:
+            q_values = estimator.predict(state=[state])[0]
+            score = q_values[1] - q_values[0]   # anomaly score
+            action = np.argmax(q_values)        # baseline预测
+
+            y_true.append(int(env.timeseries['anomaly'][env.timeseries_curser]))
+            scores.append(score)
+            preds.append(action)
+
+            next_state, reward, done, _ = env.step(action)
+            if not done:
+                state = next_state[action]
+
+        all_y_true.extend(y_true)
+        all_scores.extend(scores)
+        all_preds.extend(preds)
+
+    y_true = np.array(all_y_true)
+    scores = np.array(all_scores)
+    preds = np.array(all_preds)
+
+    # ---------------- baseline ----------------
+    baseline_p = precision_score(y_true, preds)
+    baseline_r = recall_score(y_true, preds)
+    baseline_f1 = f1_score(y_true, preds)
+    print(f"Baseline -> Precision={baseline_p:.3f}, Recall={baseline_r:.3f}, F1={baseline_f1:.3f}")
+
+    # ---------------- 阈值搜索 ----------------
+    precisions, recalls, thresholds = precision_recall_curve(y_true, scores)
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+    best_idx = np.argmax(f1_scores)
+    best_thresh = thresholds[best_idx]
+    best_f1 = f1_scores[best_idx]
+    print(f"Best threshold={best_thresh:.4f} -> Precision={precisions[best_idx]:.3f}, Recall={recalls[best_idx]:.3f}, F1={best_f1:.3f}")
+    print(f"PR-AUC={average_precision_score(y_true, scores):.3f}")
+
+    if plot_pr:
+        plt.plot(recalls, precisions, label="PR curve")
+        plt.scatter(recalls[best_idx], precisions[best_idx], color="red", label=f"Best F1={best_f1:.3f}")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.legend()
+        # plt.show()
+        save_path = os.path.join("pr_curve.png")
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"PR curve saved to {save_path}")
+
+    # ---------------- 检测延迟 ----------------
+    y_pred_best = (scores >= best_thresh).astype(int)
+    delays = detection_delay(y_true, y_pred_best)
+    mean_delay = np.mean([d for d in delays if np.isfinite(d)]) if any(np.isfinite(delays)) else None
+    print(f"Detection Delay -> mean={mean_delay}, undetected={sum(np.isinf(delays))}")
+
+    # ---------------- 后处理 ----------------
+    for k in k_list:
+        y_post = consecutive_filter(y_pred_best, k=k)
+        p = precision_score(y_true, y_post)
+        r = recall_score(y_true, y_post)
+        f1v = f1_score(y_true, y_post)
+        print(f"After consecutive k={k} -> Precision={p:.3f}, Recall={r:.3f}, F1={f1v:.3f}")
+
+    return {
+        "baseline": (baseline_p, baseline_r, baseline_f1),
+        "best": (precisions[best_idx], recalls[best_idx], best_f1),
+        "pr_auc": average_precision_score(y_true, scores),
+        "delay_mean": mean_delay
+    }
+
+# 辅助函数
+def detection_delay(y_true, y_pred):
+    delays = []
+    i = 0
+    while i < len(y_true):
+        if y_true[i] == 1:   # anomaly segment
+            start = i
+            while i < len(y_true) and y_true[i] == 1:
+                i += 1
+            end = i - 1
+            detected = np.where(y_pred[start:end+1] == 1)[0]
+            if len(detected) > 0:
+                delays.append(detected[0])  # 相对 start 的延迟
+            else:
+                delays.append(np.inf)
+        else:
+            i += 1
+    return np.array(delays)
+
+def consecutive_filter(y_pred, k=3):
+    out = np.zeros_like(y_pred)
+    for i in range(len(y_pred)):
+        if i-k+1 >= 0 and y_pred[i-k+1:i+1].sum() >= k:
+            out[i] = 1
+    return out
+
 class active_learning(object):
     def __init__(self, env, N, strategy, estimator, already_selected):
         self.env = env
@@ -815,7 +939,7 @@ def train(num_LP, num_AL, discount_factor):
         # exp_relative_dir = ['RNN Binary d0.9 s25 h64 b256 A1_partial_data_' + percentage[j], 'RNN Binary d0.9 s25 h64 b256 A2_partial_data_' + percentage[j],
         #                     'RNN Binary d0.9 s25 h64 b256 A3_partial_data_' + percentage[j], 'RNN Binary d0.9 s25 h64 b256 A4_partial_data_' + percentage[j]]
         # exp_relative_dir = ['RNN Binary d0.9 s25 h64 b256 A1-4_all_data']
-        exp_relative_dir = ['A2 LP 1500init_warmup h128 b256 300ep num_LP'+str(num_LP)+' num_AL'+str(num_AL) +
+        exp_relative_dir = ['A1 LP 1500init_warmup h128 b256 300ep num_LP'+str(num_LP)+' num_AL'+str(num_AL) +
                             ' d'+str(discount_factor)]
         # exp_relative_dir = ['RNN Binary d0.9 s25 h64 b256 Aniyama-dataport']
 
@@ -828,7 +952,7 @@ def train(num_LP, num_AL, discount_factor):
         # dataset_dir = ['/home/sciphilab/sbsplusplus/datasets/Aniyama_groundtruth/dataport/']
         #dataset_dir = ['/home/scifilab/anomaly_detection/dataset/A1Benchmark/']
         # dataset_dir = ['/Users/tongwu/Downloads/ydata-labeled-time-series-anomalies-v1_0/A1Benchmark']
-        dataset_dir = ['A2Benchmark']
+        dataset_dir = ['A1Benchmark']
         #dataset_dir = ['/home/tongwu/sbsplusplus/ydata-labeled-time-series-anomalies-v1_0/A1Benchmark']
         #dataset_dir = ['/home/scifilab/anomaly_detection/dataset/KPI_dataset/']
         for i in range(len(dataset_dir)):
@@ -890,12 +1014,20 @@ def train(num_LP, num_AL, discount_factor):
                            num_label_propagation=num_LP,
                            num_active_learning=num_AL,
                            test=test)
-                optimization_metric = q_learning_validator(env_test, qlearn_estimator,
-                                                           int(env.datasetsize*(1-validation_separate_ratio)), experiment_dir)
-            return optimization_metric
+                # optimization_metric = q_learning_validator(env_test, qlearn_estimator, int(env.datasetsize*(1-validation_separate_ratio)), experiment_dir)
+
+                results = enhanced_validator(
+                    env_test,
+                    qlearn_estimator,
+                    num_episodes=int(env.datasetsize * (1 - validation_separate_ratio)),
+                    k_list=[1, 3, 5],  # 后处理连续 k 的取值，可以自己调
+                    plot_pr=True  # 是否绘制 PR 曲线
+                )
+            # return optimization_metric
+            return results
 
 
-train(100, 15, 1.0)
+train(100, 30, 1.0)
 # train(100, 30, 1.0)
 # train(100, 50, 1.0)
 # train(100, 100, 1.0)
